@@ -24,7 +24,9 @@ PROCESSED_DIR = BASE_DIR / "data" / "processed"
 FIGURES_DIR = BASE_DIR / "outputs" / "figures"
 REPORTS_DIR = BASE_DIR / "outputs" / "reports"
 API_CACHE_DIR = BASE_DIR / ".api_cache"
+ADMIN_DIVISION_CACHE_DIR = API_CACHE_DIR / "admin_divisions"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+ALIYUN_BOUND_URL = "https://geo.datav.aliyun.com/areas_v3/bound/{code}_full.json"
 
 DAILY_FILE = PROCESSED_DIR / "china_weather_daily_5y.csv"
 MONTHLY_FILE = PROCESSED_DIR / "china_weather_monthly_5y.csv"
@@ -77,9 +79,10 @@ class City:
     lat: float
     lon: float
     elevation: int = 0
+    city_code: str = ""
 
 
-CITIES: List[City] = [
+FALLBACK_CITIES: List[City] = [
     City("北京", "北京", "华北", 39.9042, 116.4074, 43),
     City("天津", "天津", "华北", 39.0842, 117.2009, 5),
     City("石家庄", "河北", "华北", 38.0428, 114.5149, 83),
@@ -117,6 +120,110 @@ CITIES: List[City] = [
     City("乌鲁木齐", "新疆", "西北", 43.8256, 87.6168, 800),
 ]
 
+PROVINCE_CODE_MAP = {
+    "北京市": "110000",
+    "天津市": "120000",
+    "河北省": "130000",
+    "山西省": "140000",
+    "内蒙古自治区": "150000",
+    "辽宁省": "210000",
+    "吉林省": "220000",
+    "黑龙江省": "230000",
+    "上海市": "310000",
+    "江苏省": "320000",
+    "浙江省": "330000",
+    "安徽省": "340000",
+    "福建省": "350000",
+    "江西省": "360000",
+    "山东省": "370000",
+    "河南省": "410000",
+    "湖北省": "420000",
+    "湖南省": "430000",
+    "广东省": "440000",
+    "广西壮族自治区": "450000",
+    "海南省": "460000",
+    "重庆市": "500000",
+    "四川省": "510000",
+    "贵州省": "520000",
+    "云南省": "530000",
+    "西藏自治区": "540000",
+    "陕西省": "610000",
+    "甘肃省": "620000",
+    "青海省": "630000",
+    "宁夏回族自治区": "640000",
+    "新疆维吾尔自治区": "650000",
+}
+
+PROVINCE_SHORT_NAME_MAP = {
+    "北京": "北京市",
+    "天津": "天津市",
+    "河北": "河北省",
+    "山西": "山西省",
+    "内蒙古": "内蒙古自治区",
+    "辽宁": "辽宁省",
+    "吉林": "吉林省",
+    "黑龙江": "黑龙江省",
+    "上海": "上海市",
+    "江苏": "江苏省",
+    "浙江": "浙江省",
+    "安徽": "安徽省",
+    "福建": "福建省",
+    "江西": "江西省",
+    "山东": "山东省",
+    "河南": "河南省",
+    "湖北": "湖北省",
+    "湖南": "湖南省",
+    "广东": "广东省",
+    "广西": "广西壮族自治区",
+    "海南": "海南省",
+    "重庆": "重庆市",
+    "四川": "四川省",
+    "贵州": "贵州省",
+    "云南": "云南省",
+    "西藏": "西藏自治区",
+    "陕西": "陕西省",
+    "甘肃": "甘肃省",
+    "青海": "青海省",
+    "宁夏": "宁夏回族自治区",
+    "新疆": "新疆维吾尔自治区",
+}
+
+PROVINCE_REGION_MAP = {
+    "北京市": "华北",
+    "天津市": "华北",
+    "河北省": "华北",
+    "山西省": "华北",
+    "内蒙古自治区": "华北",
+    "辽宁省": "东北",
+    "吉林省": "东北",
+    "黑龙江省": "东北",
+    "上海市": "华东",
+    "江苏省": "华东",
+    "浙江省": "华东",
+    "安徽省": "华东",
+    "福建省": "华东",
+    "江西省": "华东",
+    "山东省": "华东",
+    "河南省": "华中",
+    "湖北省": "华中",
+    "湖南省": "华中",
+    "广东省": "华南",
+    "广西壮族自治区": "华南",
+    "海南省": "华南",
+    "重庆市": "西南",
+    "四川省": "西南",
+    "贵州省": "西南",
+    "云南省": "西南",
+    "西藏自治区": "西南",
+    "陕西省": "西北",
+    "甘肃省": "西北",
+    "青海省": "西北",
+    "宁夏回族自治区": "西北",
+    "新疆维吾尔自治区": "西北",
+}
+
+MUNICIPALITY_PROVINCES = {"北京市", "天津市", "上海市", "重庆市"}
+
 
 def ensure_dirs() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,6 +231,7 @@ def ensure_dirs() -> None:
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     API_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ADMIN_DIVISION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,12 +249,111 @@ def calc_date_range() -> tuple[date, date]:
 
 def city_cache_file(city: City, start_date: date, end_date: date) -> Path:
     suffix = f"{start_date.isoformat()}_{end_date.isoformat()}"
-    return RAW_DIR / f"{city.city}_{suffix}.csv"
+    cache_key = city.city_code or f"{normalize_province_name(city.province)}_{city.city}"
+    safe_key = str(cache_key).replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return RAW_DIR / f"{safe_key}_{suffix}.csv"
 
 
 def find_latest_city_cache(city: City) -> Path | None:
-    candidates = sorted(RAW_DIR.glob(f"{city.city}_*.csv"))
+    cache_key = city.city_code or f"{normalize_province_name(city.province)}_{city.city}"
+    safe_key = str(cache_key).replace("/", "_").replace("\\", "_").replace(" ", "_")
+    candidates = sorted(RAW_DIR.glob(f"{safe_key}_*.csv"))
     return candidates[-1] if candidates else None
+
+
+def normalize_province_name(name: str) -> str:
+    return PROVINCE_SHORT_NAME_MAP.get(name, name)
+
+
+def admin_cache_file(code: str) -> Path:
+    return ADMIN_DIVISION_CACHE_DIR / f"{code}_full.json"
+
+
+def fetch_admin_geojson(code: str, force_refresh: bool = False) -> dict:
+    cache_file = admin_cache_file(code)
+    if cache_file.exists() and not force_refresh:
+        return json.loads(cache_file.read_text(encoding="utf-8"))
+
+    response = requests.get(
+        ALIYUN_BOUND_URL.format(code=code),
+        timeout=60,
+        headers={"User-Agent": "china-weather-analysis/1.0"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return payload
+
+
+def extract_feature_center(feature: dict) -> tuple[float, float] | None:
+    props = feature.get("properties", {})
+    center = props.get("center") or props.get("centroid") or props.get("cp")
+    if isinstance(center, list) and len(center) >= 2:
+        return float(center[1]), float(center[0])
+    return None
+
+
+def build_prefecture_level_cities(force_refresh: bool = False) -> list[City]:
+    cities: list[City] = []
+    seen_codes: set[str] = set()
+
+    for province_name, province_code in PROVINCE_CODE_MAP.items():
+        region = PROVINCE_REGION_MAP.get(province_name, "其他")
+        try:
+            geojson = fetch_admin_geojson(province_code, force_refresh=force_refresh)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] {province_name} 行政区划加载失败，稍后回退到内置城市样本: {exc}")
+            return FALLBACK_CITIES
+
+        features = geojson.get("features", [])
+        province_cities: list[City] = []
+        for feature in features:
+            props = feature.get("properties", {})
+            level = str(props.get("level", ""))
+            if level != "city":
+                continue
+            center = extract_feature_center(feature)
+            if center is None:
+                continue
+            city_name = props.get("name")
+            city_code = str(props.get("adcode", ""))
+            if not city_name or not city_code or city_code in seen_codes:
+                continue
+            lat, lon = center
+            province_cities.append(
+                City(
+                    city=city_name,
+                    province=province_name,
+                    region=region,
+                    lat=lat,
+                    lon=lon,
+                    city_code=city_code,
+                )
+            )
+            seen_codes.add(city_code)
+
+        if province_cities:
+            cities.extend(province_cities)
+            continue
+
+        if province_name in MUNICIPALITY_PROVINCES:
+            province_feature = next(iter(features), None)
+            center = extract_feature_center(province_feature) if province_feature else None
+            if center is not None:
+                lat, lon = center
+                cities.append(
+                    City(
+                        city=province_name,
+                        province=province_name,
+                        region=region,
+                        lat=lat,
+                        lon=lon,
+                        city_code=province_code,
+                    )
+                )
+                seen_codes.add(province_code)
+
+    return cities or FALLBACK_CITIES
 
 
 def fetch_city_weather(city: City, start_date: date, end_date: date, force_refresh: bool = False) -> pd.DataFrame:
@@ -218,10 +425,11 @@ def fetch_city_weather(city: City, start_date: date, end_date: date, force_refre
 
     df = pd.DataFrame(daily_data)
     df["city"] = city.city
-    df["province"] = city.province
+    df["province"] = normalize_province_name(city.province)
     df["region"] = city.region
     df["lat"] = city.lat
     df["lon"] = city.lon
+    df["city_code"] = city.city_code
     df.to_csv(cache_file, index=False, encoding="utf-8-sig")
     return df
 
@@ -271,6 +479,9 @@ def clean_weather_data(df: pd.DataFrame) -> pd.DataFrame:
     }
     df = df.rename(columns=rename_map)
     df["date"] = pd.to_datetime(df["date"])
+    df["province"] = df["province"].map(lambda value: normalize_province_name(str(value)))
+    if "city_code" not in df.columns:
+        df["city_code"] = ""
     df["year"] = df["date"].dt.year
     df["month"] = df["date"].dt.month
     df["year_month"] = df["date"].dt.to_period("M").astype(str)
@@ -300,7 +511,7 @@ def clean_weather_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
     monthly = (
-        df.groupby(["city", "province", "region", "lat", "lon", "year", "month", "year_month"], as_index=False)
+        df.groupby(["city", "city_code", "province", "region", "lat", "lon", "year", "month", "year_month"], as_index=False)
         .agg(
             avg_temp=("avg_temp", "mean"),
             min_temp=("min_temp", "mean"),
@@ -326,6 +537,7 @@ def compute_city_trends(monthly_df: pd.DataFrame) -> pd.DataFrame:
         rows.append(
             {
                 "city": city,
+                "city_code": city_df["city_code"].iloc[0] if "city_code" in city_df.columns else "",
                 "province": city_df["province"].iloc[0],
                 "region": city_df["region"].iloc[0],
                 "lat": city_df["lat"].iloc[0],
@@ -683,6 +895,151 @@ def build_map_timeline_config(monthly_df: pd.DataFrame) -> dict:
     }
 
 
+def build_map_timeline_config_v2(monthly_df: pd.DataFrame) -> dict:
+    monthly_df = monthly_df.copy()
+    if "city_code" not in monthly_df.columns:
+        monthly_df["city_code"] = ""
+    monthly_df["province"] = monthly_df["province"].map(lambda value: normalize_province_name(str(value)))
+    metric_labels = {
+        "avg_temp": "average temperature",
+        "precipitation": "precipitation",
+        "wind_speed": "wind speed",
+    }
+    metric_units = {
+        "avg_temp": "°C",
+        "precipitation": "mm",
+        "wind_speed": "m/s",
+    }
+    province_month = (
+        monthly_df.groupby(["province", "year_month"], as_index=False)
+        .agg(
+            avg_temp=("avg_temp", "mean"),
+            precipitation=("precipitation", "mean"),
+            wind_speed=("wind_speed", "mean"),
+        )
+        .round(2)
+    )
+    city_month = (
+        monthly_df.groupby(["province", "city", "city_code", "lat", "lon", "year_month"], as_index=False)
+        .agg(
+            avg_temp=("avg_temp", "mean"),
+            precipitation=("precipitation", "mean"),
+            wind_speed=("wind_speed", "mean"),
+        )
+        .round(2)
+    )
+    provinces = sorted(province_month["province"].dropna().unique().tolist())
+    periods = sorted(province_month["year_month"].dropna().unique().tolist())
+    province_display_names = {province: province for province in provinces}
+    reverse_display_names = {display: short for short, display in province_display_names.items()}
+
+    metrics_payload: dict[str, dict] = {}
+    for metric in metric_labels:
+        metric_series = []
+        metric_values: list[float] = []
+        for period in periods:
+            period_df = province_month[province_month["year_month"] == period]
+            value_map = {row["province"]: row[metric] for _, row in period_df.iterrows()}
+            period_metric_values: list[float] = []
+            series_data = []
+            for province in provinces:
+                value = value_map.get(province)
+                display_name = province_display_names[province]
+                if pd.notna(value):
+                    numeric_value = round(float(value), 2)
+                    metric_values.append(float(value))
+                    period_metric_values.append(float(value))
+                    series_data.append({"name": display_name, "value": numeric_value})
+                else:
+                    series_data.append({"name": display_name, "value": None})
+            period_min = round(min(period_metric_values), 2) if period_metric_values else 0
+            period_max = round(max(period_metric_values), 2) if period_metric_values else 1
+            if period_min == period_max:
+                period_max = round(period_min + 1, 2)
+            metric_series.append({"period": period, "data": series_data, "min": period_min, "max": period_max})
+
+        metrics_payload[metric] = {
+            "label": metric_labels[metric],
+            "unit": metric_units[metric],
+            "min": round(min(metric_values), 2) if metric_values else 0,
+            "max": round(max(metric_values), 2) if metric_values else 1,
+            "series": metric_series,
+        }
+
+    national_series = (
+        province_month.groupby("year_month", as_index=False)
+        .agg(
+            avg_temp=("avg_temp", "mean"),
+            precipitation=("precipitation", "mean"),
+            wind_speed=("wind_speed", "mean"),
+        )
+        .round(2)
+        .set_index("year_month")
+    )
+
+    province_trends: dict[str, dict[str, list[float | None]]] = {}
+    province_city_metrics: dict[str, dict[str, dict]] = {}
+    for province in provinces:
+        province_df = province_month[province_month["province"] == province].set_index("year_month")
+        province_trends[province] = {
+            metric: [
+                round(float(province_df.loc[period, metric]), 2) if period in province_df.index and pd.notna(province_df.loc[period, metric]) else None
+                for period in periods
+            ]
+            for metric in metric_labels
+        }
+
+        province_city_metrics[province] = {}
+        province_city_df = city_month[city_month["province"] == province]
+        for metric in metric_labels:
+            metric_series = []
+            metric_values: list[float] = []
+            for period in periods:
+                period_df = province_city_df[province_city_df["year_month"] == period]
+                period_metric_values: list[float] = []
+                series_data = []
+                for _, row in period_df.iterrows():
+                    value = row[metric]
+                    if pd.isna(value):
+                        continue
+                    series_data.append(
+                        {
+                            "name": row["city"],
+                            "value": [round(float(row["lon"]), 4), round(float(row["lat"]), 4), round(float(value), 2)],
+                            "city_code": row["city_code"] if pd.notna(row["city_code"]) else "",
+                        }
+                    )
+                    metric_values.append(float(value))
+                    period_metric_values.append(float(value))
+                period_min = round(min(period_metric_values), 2) if period_metric_values else 0
+                period_max = round(max(period_metric_values), 2) if period_metric_values else 1
+                if period_min == period_max:
+                    period_max = round(period_min + 1, 2)
+                metric_series.append({"period": period, "data": series_data, "min": period_min, "max": period_max})
+
+            province_city_metrics[province][metric] = {
+                "label": metric_labels[metric],
+                "unit": metric_units[metric],
+                "min": round(min(metric_values), 2) if metric_values else 0,
+                "max": round(max(metric_values), 2) if metric_values else 1,
+                "series": metric_series,
+            }
+
+    return {
+        "periods": periods,
+        "metrics": metrics_payload,
+        "province_city_metrics": province_city_metrics,
+        "province_codes": {province: PROVINCE_CODE_MAP.get(province, "") for province in provinces},
+        "province_trends": province_trends,
+        "province_display_names": province_display_names,
+        "province_name_lookup": reverse_display_names,
+        "national_trends": {
+            metric: [round(float(national_series.loc[period, metric]), 2) if period in national_series.index else None for period in periods]
+            for metric in metric_labels
+        },
+    }
+
+
 def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
     geo_chart = make_geo_scatter(trend_df)
     line_chart = make_trend_line(monthly_df)
@@ -690,7 +1047,7 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
     warming_chart = make_warming_bar(trend_df)
     radar_chart = make_radar(monthly_df)
     scatter_chart = make_scatter(monthly_df)
-    map_timeline_config = build_map_timeline_config(monthly_df)
+    map_timeline_config = build_map_timeline_config_v2(monthly_df)
 
     hottest_city = trend_df.sort_values("avg_temp_5y", ascending=False).iloc[0]
     coolest_city = trend_df.sort_values("avg_temp_5y", ascending=True).iloc[0]
@@ -1056,6 +1413,9 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         let autoPlayEnabled = false;
         let isInterpolating = false;
         let suppressTimelineEvent = false;
+        let mapMode = 'national';
+        let drilldownProvince = null;
+        const provinceMapCache = new Map();
 
         async function loadChinaGeoJson() {{
             const urls = [
@@ -1196,6 +1556,171 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             }};
         }}
 
+        async function loadProvinceGeoJson(province) {{
+            const code = timelineMapConfig.province_codes[province];
+            if (!code) {{
+                throw new Error('missing province code');
+            }}
+            const cacheKey = 'province-' + code;
+            if (provinceMapCache.has(cacheKey)) {{
+                return provinceMapCache.get(cacheKey);
+            }}
+            const urls = [
+                `https://geo.datav.aliyun.com/areas_v3/bound/${{code}}_full.json`,
+                `https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=${{code}}_full`
+            ];
+            for (const url of urls) {{
+                try {{
+                    const res = await fetch(url);
+                    if (res.ok) {{
+                        const geoJson = await res.json();
+                        echarts.registerMap(cacheKey, geoJson);
+                        provinceMapCache.set(cacheKey, cacheKey);
+                        return cacheKey;
+                    }}
+                }} catch (err) {{}}
+            }}
+            throw new Error('province geojson load failed');
+        }}
+
+        function getProvinceMetricSeriesData(province, metric, index) {{
+            return timelineMapConfig.province_city_metrics?.[province]?.[metric]?.series?.[index]?.data || [];
+        }}
+
+        function getProvinceMetricRange(province, metric, index) {{
+            const meta = timelineMapConfig.province_city_metrics?.[province]?.[metric] || {{}};
+            const item = meta.series?.[index] || {{}};
+            const min = typeof item.min === 'number' ? item.min : (typeof meta.min === 'number' ? meta.min : 0);
+            const max = typeof item.max === 'number' ? item.max : (typeof meta.max === 'number' ? meta.max : 1);
+            return {{
+                min: min,
+                max: min === max ? max + 1 : max
+            }};
+        }}
+
+        function makeProvinceTimelineOption(metric, province, mapKey) {{
+            const meta = timelineMapConfig.province_city_metrics?.[province]?.[metric];
+            if (!meta) {{
+                return makeTimelineOption(metric);
+            }}
+            return {{
+                baseOption: {{
+                    backgroundColor: 'transparent',
+                    animation: true,
+                    animationDuration: 700,
+                    animationDurationUpdate: 900,
+                    timeline: {{
+                        axisType: 'category',
+                        autoPlay: false,
+                        playInterval: 2300,
+                        data: timelineMapConfig.periods,
+                        bottom: 18,
+                        left: 60,
+                        right: 60
+                    }},
+                    title: {{
+                        text: province + ' · ' + meta.label,
+                        left: 20,
+                        top: 10,
+                        textStyle: {{
+                            color: '#17324d',
+                            fontSize: 18,
+                            fontWeight: 'bold'
+                        }}
+                    }},
+                    tooltip: {{
+                        trigger: 'item',
+                        formatter: function(params) {{
+                            const value = Array.isArray(params.value) ? params.value[2] : params.value;
+                            const period = timelineMapConfig.periods[currentTimelineIndex] || '';
+                            return params.name + '<br/>' + meta.label + ': ' + value + ' ' + meta.unit + '<br/>time: ' + period;
+                        }}
+                    }},
+                    visualMap: {{
+                        min: meta.min,
+                        max: meta.max,
+                        left: 26,
+                        bottom: 84,
+                        calculable: true,
+                        textStyle: {{
+                            color: '#4b657c'
+                        }},
+                        inRange: {{
+                            color: ['#08306b', '#2171b5', '#6baed6', '#deebf7', '#fee0d2', '#fc9272', '#de2d26', '#a50f15']
+                        }}
+                    }},
+                    geo: {{
+                        map: mapKey,
+                        roam: true,
+                        zoom: 1.05,
+                        label: {{
+                            show: true,
+                            color: '#406175',
+                            fontSize: 10
+                        }},
+                        itemStyle: {{
+                            borderColor: 'rgba(255,255,255,0.72)',
+                            borderWidth: 0.8,
+                            areaColor: '#edf4fb'
+                        }},
+                        emphasis: {{
+                            label: {{
+                                color: '#0e2233'
+                            }},
+                            itemStyle: {{
+                                areaColor: '#dceef9'
+                            }}
+                        }}
+                    }},
+                    series: [
+                        {{
+                            name: meta.label,
+                            type: 'scatter',
+                            coordinateSystem: 'geo',
+                            symbolSize: function(value) {{
+                                return Math.max(10, Math.min(24, 10 + Number(value[2] || 0) * 0.35));
+                            }},
+                            encode: {{ value: 2 }},
+                            label: {{
+                                show: true,
+                                formatter: '{{b}}',
+                                position: 'right',
+                                color: '#17324d',
+                                fontSize: 11
+                            }},
+                            itemStyle: {{
+                                opacity: 0.9
+                            }}
+                        }}
+                    ]
+                }},
+                options: meta.series.map(item => {{
+                    return {{
+                        title: {{
+                            subtext: 'time: ' + item.period,
+                            subtextStyle: {{
+                                color: '#627b91'
+                            }}
+                        }},
+                        visualMap: {{
+                            min: item.min,
+                            max: item.max
+                        }},
+                        series: [{{ data: item.data }}]
+                    }};
+                }})
+            }};
+        }}
+
+        async function renderCurrentMap() {{
+            if (mapMode === 'province' && drilldownProvince) {{
+                const mapKey = await loadProvinceGeoJson(drilldownProvince);
+                timelineMapChart.setOption(makeProvinceTimelineOption(activeMetric, drilldownProvince, mapKey), true);
+                return;
+            }}
+            timelineMapChart.setOption(makeTimelineOption(activeMetric), true);
+        }}
+
         let activeMetric = 'avg_temp';
         let selectedProvince = null;
 
@@ -1209,10 +1734,16 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         }}
 
         function getMetricSeriesData(metric, index) {{
+            if (mapMode === 'province' && drilldownProvince) {{
+                return getProvinceMetricSeriesData(drilldownProvince, metric, index);
+            }}
             return timelineMapConfig.metrics[metric].series[index]?.data || [];
         }}
 
         function getMetricRange(metric, index) {{
+            if (mapMode === 'province' && drilldownProvince) {{
+                return getProvinceMetricRange(drilldownProvince, metric, index);
+            }}
             const item = timelineMapConfig.metrics[metric].series[index] || {{}};
             const min = typeof item.min === 'number' ? item.min : timelineMapConfig.metrics[metric].min;
             const max = typeof item.max === 'number' ? item.max : timelineMapConfig.metrics[metric].max;
@@ -1228,8 +1759,12 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             const toSeries = getMetricSeriesData(metric, toIndex);
             return fromSeries.map((fromItem, idx) => {{
                 const toItem = toSeries[idx] || fromItem;
-                const fromVal = typeof fromItem.value === 'number' ? fromItem.value : null;
-                const toVal = typeof toItem.value === 'number' ? toItem.value : null;
+                const fromVal = Array.isArray(fromItem.value)
+                    ? Number(fromItem.value[2])
+                    : (typeof fromItem.value === 'number' ? fromItem.value : null);
+                const toVal = Array.isArray(toItem.value)
+                    ? Number(toItem.value[2])
+                    : (typeof toItem.value === 'number' ? toItem.value : null);
                 let value = null;
                 if (fromVal != null && toVal != null) {{
                     value = Number((fromVal + (toVal - fromVal) * eased).toFixed(2));
@@ -1238,15 +1773,19 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
                 }} else {{
                     value = toVal;
                 }}
+                const fromCoords = Array.isArray(fromItem.value) ? fromItem.value.slice(0, 2) : null;
+                const toCoords = Array.isArray(toItem.value) ? toItem.value.slice(0, 2) : fromCoords;
                 return {{
                     name: toItem.name || fromItem.name,
-                    value: value
+                    value: fromCoords || toCoords ? [...(toCoords || fromCoords || []), value] : value
                 }};
             }});
         }}
 
         function applyInterpolatedFrame(metric, fromIndex, toIndex, progress) {{
-            const meta = timelineMapConfig.metrics[metric];
+            const meta = mapMode === 'province' && drilldownProvince
+                ? timelineMapConfig.province_city_metrics?.[drilldownProvince]?.[metric]
+                : timelineMapConfig.metrics[metric];
             const fromPeriod = timelineMapConfig.periods[fromIndex] || '-';
             const toPeriod = timelineMapConfig.periods[toIndex] || '-';
             const blended = interpolateSeriesData(metric, fromIndex, toIndex, progress);
@@ -1283,68 +1822,32 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
 
         function animateToPeriod(targetIndex, withInterpolation = false, interactionMode = 'auto') {{
             if (isInterpolating) return;
-            const fromIndex = currentTimelineIndex;
-            if (targetIndex === fromIndex) {{
+            if (targetIndex === currentTimelineIndex) {{
                 updateTimelineMeta();
                 return;
             }}
             isInterpolating = true;
-
-            const startInterpolation = () => {{
-                if (!withInterpolation) {{
-                    suppressTimelineEvent = true;
-                    currentTimelineIndex = targetIndex;
-                    timelineMapChart.dispatchAction({{
-                        type: 'timelineChange',
-                        currentIndex: targetIndex
-                    }});
-                    window.setTimeout(() => {{
-                        provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
-                        isInterpolating = false;
-                        updateTimelineMeta();
-                    }}, 450);
-                    return;
+            suppressTimelineEvent = true;
+            currentTimelineIndex = targetIndex;
+            renderCurrentMap().then(() => {{
+                timelineMapChart.dispatchAction({{
+                    type: 'timelineChange',
+                    currentIndex: targetIndex
+                }});
+                provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
+                isInterpolating = false;
+                updateTimelineMeta();
+                if (autoPlayEnabled) {{
+                    queueNextAutoPlay();
                 }}
-
-                const isManual = interactionMode === 'manual';
-                const duration = isManual ? 780 : 1700;
-                const steps = isManual ? 6 : 16;
-                let step = 0;
-                const tick = () => {{
-                    step += 1;
-                    const progress = Math.min(1, step / steps);
-                    applyInterpolatedFrame(activeMetric, fromIndex, targetIndex, progress);
-                    applyInterpolatedTrendFrame(activeMetric, selectedProvince, fromIndex, targetIndex, progress);
-                    if (progress < 1) {{
-                        autoPlayTimer = window.setTimeout(tick, duration / steps);
-                    }} else {{
-                        suppressTimelineEvent = true;
-                        currentTimelineIndex = targetIndex;
-                        timelineMapChart.dispatchAction({{
-                            type: 'timelineChange',
-                            currentIndex: targetIndex
-                        }});
-                        window.setTimeout(() => {{
-                            provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
-                            isInterpolating = false;
-                            updateTimelineMeta();
-                            if (autoPlayEnabled) {{
-                                queueNextAutoPlay();
-                            }}
-                        }}, 260);
-                    }}
-                }};
-                tick();
-            }};
-
-            autoPlayTimer = window.setTimeout(startInterpolation, 420);
+            }});
         }}
 
         function queueNextAutoPlay() {{
             if (!autoPlayEnabled) return;
             autoPlayTimer = window.setTimeout(() => {{
                 const nextIndex = (currentTimelineIndex + 1) % timelineMapConfig.periods.length;
-                animateToPeriod(nextIndex, true);
+                animateToPeriod(nextIndex);
             }}, 820);
         }}
 
@@ -1358,13 +1861,14 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             playBtn.textContent = '自动播放';
             isInterpolating = false;
             currentTimelineIndex = targetIndex;
-            timelineMapChart.setOption(makeTimelineOption(activeMetric), true);
-            timelineMapChart.dispatchAction({{
-                type: 'timelineChange',
-                currentIndex: targetIndex
+            renderCurrentMap().then(() => {{
+                timelineMapChart.dispatchAction({{
+                    type: 'timelineChange',
+                    currentIndex: targetIndex
+                }});
+                provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
+                updateTimelineMeta();
             }});
-            provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
-            updateTimelineMeta();
         }}
 
         function startAutoPlay() {{
@@ -1477,7 +1981,7 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         function activateMetric(metric) {{
             activeMetric = metric;
             metricButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.metric === metric));
-            timelineMapChart.setOption(makeTimelineOption(metric), true);
+            renderCurrentMap();
             provinceTrendChart.setOption(makeProvinceTrendOption(metric, selectedProvince), true);
             updateTimelineMeta();
         }}
@@ -1502,8 +2006,11 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         }});
 
         resetBtn.addEventListener('click', () => {{
+            mapMode = 'national';
+            drilldownProvince = null;
             selectedProvince = null;
             provinceLabel.textContent = '当前联动：全国平均';
+            renderCurrentMap();
             provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
         }});
 
@@ -1518,11 +2025,29 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         }});
 
         timelineMapChart.on('click', params => {{
+            if (mapMode === 'province') return;
             if (!params.name) return;
             selectedProvince = timelineMapConfig.province_name_lookup[params.name] || params.name;
             const selectedDisplay = timelineMapConfig.province_display_names[selectedProvince] || params.name;
             provinceLabel.textContent = '当前联动：' + selectedDisplay;
             provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
+        }});
+
+        timelineMapChart.on('dblclick', params => {{
+            if (mapMode !== 'national' || !params.name) return;
+            const province = timelineMapConfig.province_name_lookup[params.name] || params.name;
+            if (!timelineMapConfig.province_city_metrics?.[province]) return;
+            mapMode = 'province';
+            drilldownProvince = province;
+            selectedProvince = province;
+            provinceLabel.textContent = '当前联动：' + province + ' / city view';
+            renderCurrentMap().then(() => {{
+                timelineMapChart.dispatchAction({{
+                    type: 'timelineChange',
+                    currentIndex: currentTimelineIndex
+                }});
+                provinceTrendChart.setOption(makeProvinceTrendOption(activeMetric, selectedProvince), true);
+            }});
         }});
 
         provinceTrendChart.on('click', params => {{
@@ -1606,9 +2131,11 @@ def main() -> None:
     args = parse_args()
     ensure_dirs()
     start_date, end_date = calc_date_range()
+    cities = build_prefecture_level_cities(force_refresh=args.force_refresh)
 
     print(f"抓取区间: {start_date.isoformat()} -> {end_date.isoformat()}")
-    daily_df = crawl_weather_data(CITIES, start_date, end_date, args.force_refresh, args.workers)
+    print(f"鍩庡競鏍锋湰: {len(cities)}")
+    daily_df = crawl_weather_data(cities, start_date, end_date, args.force_refresh, args.workers)
     monthly_df = aggregate_monthly(daily_df)
     trend_df = compute_city_trends(monthly_df)
 
