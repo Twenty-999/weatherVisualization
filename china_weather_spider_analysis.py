@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, List
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -25,8 +29,11 @@ FIGURES_DIR = BASE_DIR / "outputs" / "figures"
 REPORTS_DIR = BASE_DIR / "outputs" / "reports"
 API_CACHE_DIR = BASE_DIR / ".api_cache"
 ADMIN_DIVISION_CACHE_DIR = API_CACHE_DIR / "admin_divisions"
+FAILED_CITIES_FILE = API_CACHE_DIR / "failed_cities.json"
+DASHBOARD_STATUS_FILE = API_CACHE_DIR / "dashboard_status.json"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 ALIYUN_BOUND_URL = "https://geo.datav.aliyun.com/areas_v3/bound/{code}_full.json"
+DEFAULT_DASHBOARD_API_PORT = 8765
 
 DAILY_FILE = PROCESSED_DIR / "china_weather_daily_5y.csv"
 MONTHLY_FILE = PROCESSED_DIR / "china_weather_monthly_5y.csv"
@@ -234,10 +241,70 @@ def ensure_dirs() -> None:
     ADMIN_DIVISION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def save_failed_cities(cities: list[City]) -> None:
+    payload = [
+        {
+            "city": city.city,
+            "province": city.province,
+            "region": city.region,
+            "lat": city.lat,
+            "lon": city.lon,
+            "elevation": city.elevation,
+            "city_code": city.city_code,
+        }
+        for city in cities
+    ]
+    FAILED_CITIES_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_failed_cities() -> list[City]:
+    if not FAILED_CITIES_FILE.exists():
+        return []
+    payload = json.loads(FAILED_CITIES_FILE.read_text(encoding="utf-8"))
+    cities: list[City] = []
+    for item in payload:
+        cities.append(
+            City(
+                city=item["city"],
+                province=item["province"],
+                region=item["region"],
+                lat=float(item["lat"]),
+                lon=float(item["lon"]),
+                elevation=int(item.get("elevation", 0)),
+                city_code=str(item.get("city_code", "")),
+            )
+        )
+    return cities
+
+
+def write_dashboard_status(status: dict) -> None:
+    DASHBOARD_STATUS_FILE.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_dashboard_status() -> dict:
+    if not DASHBOARD_STATUS_FILE.exists():
+        return {
+            "running": False,
+            "mode": "",
+            "message": "暂无任务",
+            "updated_at": "",
+            "last_success": "",
+            "last_error": "",
+            "failed_count": len(load_failed_cities()),
+            "total": 0,
+            "completed": 0,
+            "success_count": 0,
+            "current_city": "",
+        }
+    return json.loads(DASHBOARD_STATUS_FILE.read_text(encoding="utf-8"))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抓取并分析近五年中国天气数据")
     parser.add_argument("--force-refresh", action="store_true", help="忽略缓存并重新抓取")
     parser.add_argument("--workers", type=int, default=2, help="并发抓取线程数")
+    parser.add_argument("--serve-dashboard", action="store_true", help="启动大屏按钮控制服务")
+    parser.add_argument("--api-port", type=int, default=DEFAULT_DASHBOARD_API_PORT, help="大屏按钮控制服务端口")
     return parser.parse_args()
 
 
@@ -357,6 +424,8 @@ def build_prefecture_level_cities(force_refresh: bool = False) -> list[City]:
 
 
 def fetch_city_weather(city: City, start_date: date, end_date: date, force_refresh: bool = False) -> pd.DataFrame:
+    if dashboard_cancel_event.is_set():
+        raise InterruptedError("任务已中断")
     cache_file = city_cache_file(city, start_date, end_date)
     if cache_file.exists() and not force_refresh:
         df = pd.read_csv(cache_file, parse_dates=["time"])
@@ -435,24 +504,71 @@ def fetch_city_weather(city: City, start_date: date, end_date: date, force_refre
 
 
 def crawl_weather_data(cities: Iterable[City], start_date: date, end_date: date, force_refresh: bool, workers: int) -> pd.DataFrame:
+    city_list = list(cities)
+    total = len(city_list)
     frames: list[pd.DataFrame] = []
     errors: list[str] = []
+    failed_city_objs: list[City] = []
+    completed = 0
+
+    status_snapshot = read_dashboard_status()
+    write_dashboard_status(
+        {
+            **status_snapshot,
+            "running": True,
+            "message": "抓取进行中",
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "total": total,
+            "completed": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "current_city": "",
+        }
+    )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(fetch_city_weather, city, start_date, end_date, force_refresh): city
-            for city in cities
+            for city in city_list
         }
         for future in as_completed(futures):
+            if dashboard_cancel_event.is_set():
+                remaining = [futures[item] for item in futures if not item.done()]
+                failed_city_objs.extend(remaining)
+                for item in futures:
+                    if not item.done():
+                        item.cancel()
+                save_failed_cities(failed_city_objs)
+                raise InterruptedError("任务已中断")
             city = futures[future]
+            completed += 1
             try:
                 frames.append(future.result())
                 print(f"[OK] {city.city} 抓取完成")
+            except InterruptedError:
+                failed_city_objs.append(city)
+                save_failed_cities(failed_city_objs)
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{city.city}: {exc}")
+                failed_city_objs.append(city)
                 print(f"[WARN] {city.city} 抓取失败: {exc}")
+            write_dashboard_status(
+                {
+                    **read_dashboard_status(),
+                    "running": True,
+                    "message": "抓取进行中",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total": total,
+                    "completed": completed,
+                    "success_count": len(frames),
+                    "failed_count": len(failed_city_objs),
+                    "current_city": city.city,
+                }
+            )
 
     if not frames:
+        save_failed_cities(failed_city_objs)
         raise RuntimeError("所有城市抓取均失败，无法继续分析")
 
     if errors:
@@ -460,6 +576,7 @@ def crawl_weather_data(cities: Iterable[City], start_date: date, end_date: date,
         for msg in errors:
             print(f"- {msg}")
 
+    save_failed_cities(failed_city_objs)
     df = pd.concat(frames, ignore_index=True)
     return clean_weather_data(df)
 
@@ -1190,6 +1307,11 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             gap: 10px;
             flex-wrap: wrap;
         }}
+        .job-actions {{
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }}
         .metric-btn {{
             border: 0;
             border-radius: 999px;
@@ -1214,12 +1336,57 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             font-size: 13px;
             cursor: pointer;
         }}
+        .job-btn {{
+            border: 0;
+            border-radius: 999px;
+            padding: 10px 14px;
+            background: linear-gradient(135deg, #17486a 0%, #26758f 100%);
+            color: #fff;
+            font-size: 13px;
+            cursor: pointer;
+            box-shadow: 0 10px 22px rgba(34, 100, 129, 0.22);
+        }}
         .status-pill {{
             padding: 9px 14px;
             border-radius: 999px;
             background: rgba(19, 40, 59, 0.08);
             color: #35546d;
             font-size: 13px;
+        }}
+        .job-status {{
+            padding: 9px 14px;
+            border-radius: 999px;
+            background: rgba(20, 67, 108, 0.08);
+            color: #2f5877;
+            font-size: 13px;
+        }}
+        .job-progress-wrap {{
+            min-width: 320px;
+            flex: 1;
+            max-width: 520px;
+        }}
+        .job-progress-head {{
+            display: flex;
+            justify-content: space-between;
+            color: #60788d;
+            font-size: 12px;
+            margin-bottom: 8px;
+        }}
+        .job-progress-track {{
+            position: relative;
+            height: 10px;
+            border-radius: 999px;
+            background: rgba(81, 118, 145, 0.18);
+            overflow: hidden;
+        }}
+        .job-progress-bar {{
+            position: absolute;
+            inset: 0 auto 0 0;
+            width: 0%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #1f6aa5 0%, #2fbec0 100%);
+            box-shadow: 0 0 18px rgba(47, 190, 192, 0.3);
+            transition: width 0.35s ease;
         }}
         .map-meta {{
             display: flex;
@@ -1356,15 +1523,30 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
                             <button class="metric-btn" data-metric="precipitation">降水量</button>
                             <button class="metric-btn" data-metric="wind_speed">平均风速</button>
                         </div>
+                        <div class="job-actions">
+                            <button class="job-btn" id="refresh-all-btn">更新全部数据</button>
+                            <button class="job-btn" id="refresh-failed-btn">仅重抓失败数据</button>
+                            <button class="ghost-btn" id="cancel-job-btn" disabled>中断任务</button>
+                        </div>
                         <button class="ghost-btn" id="timeline-play">自动播放</button>
                         <button class="ghost-btn" id="timeline-reset">查看全国</button>
                         <div class="status-pill" id="selected-province-label">当前联动：全国平均</div>
+                        <div class="job-status" id="job-status-label">数据任务：未连接按钮服务</div>
                     </div>
                 </div>
                 <div class="map-meta">
                     <div class="month-chip">
                         <div class="month-chip-label">当前月份</div>
                         <div class="month-chip-value" id="current-period-chip">2021-04</div>
+                    </div>
+                    <div class="job-progress-wrap">
+                        <div class="job-progress-head">
+                            <span>数据更新进度</span>
+                            <span id="job-progress-text">0 / 0</span>
+                        </div>
+                        <div class="job-progress-track">
+                            <div class="job-progress-bar" id="job-progress-bar"></div>
+                        </div>
                     </div>
                     <div class="progress-wrap">
                         <div class="progress-head">
@@ -1397,17 +1579,26 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
     </div>
     <script>
         const timelineMapConfig = {map_config_json};
+        const dashboardApiBase = 'http://127.0.0.1:{DEFAULT_DASHBOARD_API_PORT}';
         const timelineMapEl = document.getElementById('timeline-map');
         const provinceTrendEl = document.getElementById('province-trend');
         const metricButtons = Array.from(document.querySelectorAll('.metric-btn'));
         const playBtn = document.getElementById('timeline-play');
         const resetBtn = document.getElementById('timeline-reset');
+        const refreshAllBtn = document.getElementById('refresh-all-btn');
+        const refreshFailedBtn = document.getElementById('refresh-failed-btn');
+        const cancelJobBtn = document.getElementById('cancel-job-btn');
+        const jobStatusLabel = document.getElementById('job-status-label');
+        const jobProgressText = document.getElementById('job-progress-text');
+        const jobProgressBar = document.getElementById('job-progress-bar');
         const provinceLabel = document.getElementById('selected-province-label');
         const currentPeriodChip = document.getElementById('current-period-chip');
         const progressText = document.getElementById('progress-text');
         const progressBar = document.getElementById('timeline-progress-bar');
         const timelineMapChart = echarts.init(timelineMapEl, null, {{ renderer: 'canvas' }});
         const provinceTrendChart = echarts.init(provinceTrendEl, null, {{ renderer: 'canvas' }});
+        let lastJobRunning = false;
+        let lastJobUpdatedAt = '';
         let currentTimelineIndex = 0;
         let autoPlayTimer = null;
         let autoPlayEnabled = false;
@@ -1724,6 +1915,81 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         let activeMetric = 'avg_temp';
         let selectedProvince = null;
 
+        async function fetchJobStatus() {{
+            try {{
+                const res = await fetch(dashboardApiBase + '/api/status');
+                if (!res.ok) throw new Error('status request failed');
+                const data = await res.json();
+                const failedCount = typeof data.failed_count === 'number' ? data.failed_count : 0;
+                const successCount = typeof data.success_count === 'number' ? data.success_count : 0;
+                const total = typeof data.total === 'number' ? data.total : 0;
+                const completed = typeof data.completed === 'number' ? data.completed : 0;
+                const currentCity = data.current_city || '';
+                const progressPercent = total > 0 ? Math.min(100, (completed / total) * 100) : 0;
+                jobProgressText.textContent = completed + ' / ' + total + ' · 成功 ' + successCount + ' · 失败 ' + failedCount;
+                jobProgressBar.style.width = progressPercent.toFixed(2) + '%';
+                refreshAllBtn.disabled = !!data.running;
+                refreshFailedBtn.disabled = !!data.running;
+                cancelJobBtn.disabled = !data.running;
+                if (data.running) {{
+                    jobStatusLabel.textContent = '数据任务：运行中，已完成 ' + completed + '/' + total + '，成功 ' + successCount + '，失败 ' + failedCount + (currentCity ? '，当前 ' + currentCity : '');
+                }} else if (data.last_error) {{
+                    jobStatusLabel.textContent = '数据任务：失败，成功 ' + successCount + '，失败 ' + failedCount + ' - ' + data.last_error;
+                }} else if (data.message === '任务已中断') {{
+                    jobStatusLabel.textContent = '数据任务：已中断，成功 ' + successCount + '，失败待重抓 ' + failedCount;
+                }} else if (data.last_success) {{
+                    jobStatusLabel.textContent = '数据任务：空闲，最近成功 ' + data.last_success + '，成功 ' + successCount + '，失败待重抓 ' + failedCount;
+                }} else {{
+                    jobStatusLabel.textContent = '数据任务：空闲，成功 ' + successCount + '，失败待重抓 ' + failedCount;
+                }}
+
+                if (lastJobRunning && !data.running && data.updated_at && data.updated_at !== lastJobUpdatedAt) {{
+                    if (data.last_error) {{
+                        window.alert('数据任务失败\\n成功：' + successCount + '\\n失败：' + failedCount + '\\n错误：' + data.last_error);
+                    }} else if (data.message === '任务已中断') {{
+                        window.alert('数据任务已中断\\n成功：' + successCount + '\\n失败待重抓：' + failedCount);
+                    }} else {{
+                        window.alert('数据任务完成\\n成功：' + successCount + '\\n失败：' + failedCount);
+                        window.setTimeout(() => window.location.reload(), 800);
+                    }}
+                }}
+                lastJobRunning = !!data.running;
+                lastJobUpdatedAt = data.updated_at || '';
+            }} catch (err) {{
+                jobStatusLabel.textContent = '数据任务：未连接按钮服务';
+                jobProgressText.textContent = '0 / 0 · 成功 0 · 失败 0';
+                jobProgressBar.style.width = '0%';
+                refreshAllBtn.disabled = false;
+                refreshFailedBtn.disabled = false;
+                cancelJobBtn.disabled = true;
+            }}
+        }}
+
+        async function triggerDataJob(path) {{
+            try {{
+                if (path === '/api/update/cancel') {{
+                    cancelJobBtn.disabled = true;
+                }} else {{
+                    refreshAllBtn.disabled = true;
+                    refreshFailedBtn.disabled = true;
+                    cancelJobBtn.disabled = false;
+                }}
+                const res = await fetch(dashboardApiBase + path, {{
+                    method: 'POST'
+                }});
+                const data = await res.json();
+                jobStatusLabel.textContent = '数据任务：' + data.message;
+                lastJobRunning = false;
+                lastJobUpdatedAt = '';
+                fetchJobStatus();
+            }} catch (err) {{
+                jobStatusLabel.textContent = '数据任务：按钮服务不可用';
+                refreshAllBtn.disabled = false;
+                refreshFailedBtn.disabled = false;
+                cancelJobBtn.disabled = true;
+            }}
+        }}
+
         function updateTimelineMeta() {{
             const total = timelineMapConfig.periods.length || 1;
             const current = currentTimelineIndex + 1;
@@ -1997,6 +2263,18 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             btn.addEventListener('click', () => activateMetric(btn.dataset.metric));
         }});
 
+        refreshAllBtn.addEventListener('click', () => {{
+            triggerDataJob('/api/update/full');
+        }});
+
+        refreshFailedBtn.addEventListener('click', () => {{
+            triggerDataJob('/api/update/failed');
+        }});
+
+        cancelJobBtn.addEventListener('click', () => {{
+            triggerDataJob('/api/update/cancel');
+        }});
+
         playBtn.addEventListener('click', () => {{
             if (autoPlayEnabled) {{
                 stopAutoPlay();
@@ -2068,6 +2346,8 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         }});
 
         updateTimelineMeta();
+        fetchJobStatus();
+        window.setInterval(fetchJobStatus, 4000);
     </script>
 </body>
 </html>"""
@@ -2127,15 +2407,52 @@ def save_outputs(daily_df: pd.DataFrame, monthly_df: pd.DataFrame) -> None:
     monthly_df.to_csv(MONTHLY_FILE, index=False, encoding="utf-8-sig")
 
 
-def main() -> None:
-    args = parse_args()
+def run_pipeline(force_refresh: bool = False, workers: int = 2, failed_only: bool = False) -> dict:
     ensure_dirs()
     start_date, end_date = calc_date_range()
-    cities = build_prefecture_level_cities(force_refresh=args.force_refresh)
+    all_cities = build_prefecture_level_cities(force_refresh=force_refresh)
+    if failed_only:
+        failed_codes = {city.city_code for city in load_failed_cities() if city.city_code}
+        failed_names = {(city.province, city.city) for city in load_failed_cities() if not city.city_code}
+        cities = [
+            city
+            for city in all_cities
+            if (city.city_code and city.city_code in failed_codes)
+            or ((not city.city_code) and (city.province, city.city) in failed_names)
+        ]
+        if not cities:
+            write_dashboard_status(
+                {
+                    "running": False,
+                    "mode": "failed",
+                    "message": "没有可重试的失败城市",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_success": read_dashboard_status().get("last_success", ""),
+                    "last_error": "",
+                    "failed_count": len(load_failed_cities()),
+                    "total": 0,
+                    "completed": 0,
+                    "success_count": 0,
+                    "current_city": "",
+                }
+            )
+            return {"ok": True, "message": "没有可重试的失败城市", "city_count": 0}
+    else:
+        cities = all_cities
 
     print(f"抓取区间: {start_date.isoformat()} -> {end_date.isoformat()}")
-    print(f"鍩庡競鏍锋湰: {len(cities)}")
-    daily_df = crawl_weather_data(cities, start_date, end_date, args.force_refresh, args.workers)
+    print(f"城市样本: {len(cities)}")
+    daily_df = crawl_weather_data(cities, start_date, end_date, force_refresh, workers)
+    if failed_only and DAILY_FILE.exists():
+        existing_daily = pd.read_csv(DAILY_FILE, parse_dates=["date"])
+        target_keys = {(city.city_code or "", city.city) for city in cities}
+        existing_daily["city_code"] = existing_daily["city_code"].fillna("") if "city_code" in existing_daily.columns else ""
+        remaining_daily = existing_daily[
+            ~existing_daily.apply(lambda row: (str(row.get("city_code", "")), row["city"]) in target_keys, axis=1)
+        ]
+        daily_df = pd.concat([remaining_daily, daily_df], ignore_index=True)
+        daily_df = clean_weather_data(daily_df)
+
     monthly_df = aggregate_monthly(daily_df)
     trend_df = compute_city_trends(monthly_df)
 
@@ -2143,11 +2460,195 @@ def main() -> None:
     build_dashboard(monthly_df, trend_df)
     build_report(daily_df, monthly_df, trend_df, start_date, end_date)
 
-    print("\n分析完成")
-    print(f"- 日度数据: {DAILY_FILE}")
-    print(f"- 月度数据: {MONTHLY_FILE}")
-    print(f"- 可视化大屏: {DASHBOARD_FILE}")
-    print(f"- 分析摘要: {REPORT_FILE}")
+    status = read_dashboard_status()
+    write_dashboard_status(
+        {
+            "running": False,
+            "mode": "failed" if failed_only else "full",
+            "message": "更新完成",
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_success": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_error": "",
+            "failed_count": len(load_failed_cities()),
+            "total": len(cities),
+            "completed": len(cities),
+            "success_count": len(cities) - len(load_failed_cities()),
+            "current_city": "",
+        }
+    )
+    return {
+        "ok": True,
+        "message": "更新完成",
+        "city_count": len(cities),
+        "failed_count": len(load_failed_cities()),
+        "last_success": status.get("last_success", ""),
+    }
+
+
+dashboard_job_lock = threading.Lock()
+dashboard_cancel_event = threading.Event()
+
+
+def start_dashboard_job(force_refresh: bool, workers: int, failed_only: bool) -> tuple[bool, str]:
+    if dashboard_job_lock.locked():
+        return False, "已有更新任务正在运行"
+
+    def runner() -> None:
+        dashboard_job_lock.acquire()
+        dashboard_cancel_event.clear()
+        try:
+            write_dashboard_status(
+                {
+                    "running": True,
+                    "mode": "failed" if failed_only else "full",
+                    "message": "任务运行中",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_success": read_dashboard_status().get("last_success", ""),
+                    "last_error": "",
+                    "failed_count": len(load_failed_cities()),
+                    "total": 0,
+                    "completed": 0,
+                    "success_count": 0,
+                    "current_city": "",
+                }
+            )
+            run_pipeline(force_refresh=force_refresh, workers=workers, failed_only=failed_only)
+        except InterruptedError:
+            current_status = read_dashboard_status()
+            write_dashboard_status(
+                {
+                    **current_status,
+                    "running": False,
+                    "message": "任务已中断",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_error": "",
+                    "current_city": "",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            write_dashboard_status(
+                {
+                    "running": False,
+                    "mode": "failed" if failed_only else "full",
+                    "message": "任务失败",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_success": read_dashboard_status().get("last_success", ""),
+                    "last_error": str(exc),
+                    "failed_count": len(load_failed_cities()),
+                    "total": read_dashboard_status().get("total", 0),
+                    "completed": read_dashboard_status().get("completed", 0),
+                    "success_count": read_dashboard_status().get("success_count", 0),
+                    "current_city": "",
+                }
+            )
+        finally:
+            dashboard_job_lock.release()
+
+    threading.Thread(target=runner, daemon=True).start()
+    return True, "任务已启动"
+
+
+def cancel_dashboard_job() -> tuple[bool, str]:
+    if not dashboard_job_lock.locked():
+        return False, "当前没有运行中的任务"
+    dashboard_cancel_event.set()
+    current_status = read_dashboard_status()
+    write_dashboard_status(
+        {
+            **current_status,
+            "running": True,
+            "message": "已发送中断请求，等待当前城市结束",
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    return True, "已发送中断请求"
+
+
+def make_dashboard_handler(workers: int):  # type: ignore[no-untyped-def]
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def _write_json(self, payload: dict, status_code: int = 200) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _write_file(self, file_path: Path) -> None:
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            content = file_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", f"{mime_type or 'text/html'}; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(content)
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self._write_json({}, 200)
+
+        def do_GET(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if path in {"/", "/dashboard"}:
+                self._write_file(DASHBOARD_FILE)
+                return
+            if path == "/api/status":
+                self._write_json(read_dashboard_status())
+                return
+            self._write_json({"ok": False, "message": "not found"}, 404)
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if path == "/api/update/full":
+                ok, message = start_dashboard_job(force_refresh=True, workers=workers, failed_only=False)
+                self._write_json({"ok": ok, "message": message}, 200 if ok else 409)
+                return
+            if path == "/api/update/failed":
+                ok, message = start_dashboard_job(force_refresh=True, workers=workers, failed_only=True)
+                self._write_json({"ok": ok, "message": message}, 200 if ok else 409)
+                return
+            if path == "/api/update/cancel":
+                ok, message = cancel_dashboard_job()
+                self._write_json({"ok": ok, "message": message}, 200 if ok else 409)
+                return
+            self._write_json({"ok": False, "message": "not found"}, 404)
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A003
+            return
+
+    return DashboardHandler
+
+
+def serve_dashboard(api_port: int, workers: int) -> None:
+    write_dashboard_status(read_dashboard_status())
+    server = ThreadingHTTPServer(("127.0.0.1", api_port), make_dashboard_handler(workers))
+    print(f"Dashboard control server: http://127.0.0.1:{api_port}/dashboard")
+    server.serve_forever()
+
+
+def main() -> None:
+    args = parse_args()
+    result: dict | None = None
+    try:
+        result = run_pipeline(force_refresh=args.force_refresh, workers=args.workers, failed_only=False)
+
+        print("\n分析完成")
+        print(f"- 日度数据: {DAILY_FILE}")
+        print(f"- 月度数据: {MONTHLY_FILE}")
+        print(f"- 可视化大屏: {DASHBOARD_FILE}")
+        print(f"- 分析摘要: {REPORT_FILE}")
+        if result.get("ok"):
+            print(f"- 失败待重抓城市: {result.get('failed_count', 0)}")
+    except Exception:
+        if not args.serve_dashboard:
+            raise
+        print("初始更新失败，但将继续启动大屏按钮服务。")
+
+    if args.serve_dashboard:
+        serve_dashboard(api_port=args.api_port, workers=args.workers)
 
 
 if __name__ == "__main__":

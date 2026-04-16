@@ -12,14 +12,14 @@
 
 当前主脚本：
 
-- [china_weather_spider_analysis.py](D:/Users/Twenty/Desktop/天气可视化/china_weather_spider_analysis.py)
+- [china_weather_spider_analysis.py](weatherVisualization/china_weather_spider_analysis.py)
 
 当前主要输出：
 
-- [china_weather_dashboard_5y.html](D:/Users/Twenty/Desktop/天气可视化/outputs/figures/china_weather_dashboard_5y.html)
-- [china_weather_report_5y.md](D:/Users/Twenty/Desktop/天气可视化/outputs/reports/china_weather_report_5y.md)
-- [china_weather_daily_5y.csv](D:/Users/Twenty/Desktop/天气可视化/data/processed/china_weather_daily_5y.csv)
-- [china_weather_monthly_5y.csv](D:/Users/Twenty/Desktop/天气可视化/data/processed/china_weather_monthly_5y.csv)
+- [china_weather_dashboard_5y.html](weatherVisualization/outputs/figures/china_weather_dashboard_5y.html)
+- [china_weather_report_5y.md](weatherVisualization/outputs/reports/china_weather_report_5y.md)
+- [china_weather_daily_5y.csv](weatherVisualization/data/processed/china_weather_daily_5y.csv)
+- [china_weather_monthly_5y.csv](weatherVisualization/data/processed/china_weather_monthly_5y.csv)
 
 ## 2. 项目结构
 
@@ -58,7 +58,7 @@
 
 依赖文件：
 
-- [requirements.txt](D:/Users/Twenty/Desktop/天气可视化/requirements.txt)
+- [requirements.txt](weatherVisualization/requirements.txt)
 
 ## 4. 数据来源与采样范围
 
@@ -165,6 +165,16 @@
 - 升温趋势明显城市
 - 舒适度较高城市
 
+### 5.5 大屏数据控制
+
+当前大屏已新增本地数据控制能力：
+- 支持“更新全部数据”
+- 支持“仅重抓失败数据”
+- 支持“中断任务”
+- 支持显示总进度、成功数、失败数和当前处理城市
+- 支持将失败城市写入 `.api_cache/failed_cities.json`
+- 支持通过 `start_dashboard.bat` 一键启动本地控制服务并打开大屏
+
 ## 6. 可视化大屏说明
 
 当前大屏为一个固定栅格布局的 HTML 仪表盘，不是默认拖拽页。
@@ -224,6 +234,12 @@
 - 典型区域气候雷达图
 - 温度与降水关系散点图
 
+补充说明：
+- 地图区域已增加数据控制按钮，可直接触发全量更新、失败重抓和中断任务
+- 数据任务运行中会临时禁用两个更新按钮，避免重复点击启动多个任务
+- 任务完成后会弹出提示，并自动刷新页面状态
+- 当前任务状态信息也会在地图区域展示，便于观察数据更新进度
+
 ## 7. 运行方式
 
 ### 7.1 安装依赖
@@ -255,6 +271,26 @@ python china_weather_spider_analysis.py --workers 1
 - 当前公共接口存在限流与代理问题，建议优先使用 `--workers 1`
 - 这是目前最稳的运行方式
 
+### 7.5 启动大屏本地控制服务
+
+```powershell
+python china_weather_spider_analysis.py --serve-dashboard --workers 1
+```
+
+说明：
+- 大屏中的数据更新按钮依赖本地 HTTP 控制服务
+- 如果没有先启动该服务，按钮无法直接触发 Python 抓取任务
+- 启动后可通过 `http://127.0.0.1:8765/dashboard` 打开可交互版本
+
+### 7.6 一键启动
+
+可直接双击：
+- [start_dashboard.bat](weatherVisualization/start_dashboard.bat)
+
+作用：
+- 自动启动本地控制服务
+- 自动打开大屏地址
+
 ## 8. 输出文件说明
 
 ### 8.1 原始数据
@@ -268,13 +304,19 @@ python china_weather_spider_analysis.py --workers 1
 
 ### 8.2 清洗后数据
 
-- [china_weather_daily_5y.csv](D:/Users/Twenty/Desktop/天气可视化/data/processed/china_weather_daily_5y.csv)
-- [china_weather_monthly_5y.csv](D:/Users/Twenty/Desktop/天气可视化/data/processed/china_weather_monthly_5y.csv)
+- [china_weather_daily_5y.csv](weatherVisualization/data/processed/china_weather_daily_5y.csv)
+- [china_weather_monthly_5y.csv](weatherVisualization/data/processed/china_weather_monthly_5y.csv)
 
 ### 8.3 可视化与报告
 
-- [china_weather_dashboard_5y.html](D:/Users/Twenty/Desktop/天气可视化/outputs/figures/china_weather_dashboard_5y.html)
-- [china_weather_report_5y.md](D:/Users/Twenty/Desktop/天气可视化/outputs/reports/china_weather_report_5y.md)
+- [china_weather_dashboard_5y.html](weatherVisualization/outputs/figures/china_weather_dashboard_5y.html)
+- [china_weather_report_5y.md](weatherVisualization/outputs/reports/china_weather_report_5y.md)
+
+### 8.4 控制状态与失败清单
+
+- `.api_cache/failed_cities.json`：记录最近一次抓取失败的城市，供“仅重抓失败数据”使用
+- `.api_cache/dashboard_status.json`：记录当前大屏任务状态、进度、成功数和失败数
+- [start_dashboard.bat](weatherVisualization/start_dashboard.bat)：本地一键启动脚本
 
 ## 9. 版本迭代记录
 
@@ -513,6 +555,14 @@ python china_weather_spider_analysis.py --workers 1
 - 自动播放改为直接切换月份，不再做插值过渡
 - 城市缓存文件命名优先使用行政区代码，避免重名冲突
 
+### V16：大屏数据控制与任务中断
+本次版本新增：
+- 大屏新增“更新全部数据”“仅重抓失败数据”“中断任务”三个按钮
+- 大屏新增进度反馈，显示已完成数、总数、成功数、失败数和当前处理城市
+- 运行中会临时禁用两个更新按钮，避免重复启动多个抓取任务
+- 失败城市会持久化到 `.api_cache/failed_cities.json`，便于后续定向补抓
+- 新增 `start_dashboard.bat`，支持一键启动本地控制服务并自动打开大屏
+
 ## 10. 当前已知问题
 
 ### 10.1 台湾数据未实际落地
@@ -562,6 +612,16 @@ python china_weather_spider_analysis.py --workers 1
 - 程序只能继续使用旧缓存或旧样本城市数据
 
 这会导致省内地图虽然已经支持钻取，但页面中实际显示的城市数量仍可能很少。
+
+### 10.5 大屏数据控制依赖本地服务
+
+当前大屏中的数据更新按钮不是纯静态 HTML 能独立完成的，仍依赖本地 Python 控制服务。
+因此如果没有先启动：
+- `python china_weather_spider_analysis.py --serve-dashboard --workers 1`
+或：
+- [start_dashboard.bat](weatherVisualization/start_dashboard.bat)
+
+则 `http://127.0.0.1:8765/dashboard` 无法访问，按钮也无法实际触发数据抓取任务。
 
 ## 11. 后续可继续优化的方向
 

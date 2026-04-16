@@ -1,0 +1,13 @@
+{
+  "running": true,
+  "mode": "",
+  "message": "抓取进行中",
+  "updated_at": "2026-04-16 18:56:17",
+  "last_success": "",
+  "last_error": "",
+  "failed_count": 22,
+  "total": 367,
+  "completed": 162,
+  "success_count": 140,
+  "current_city": "南阳市"
+}

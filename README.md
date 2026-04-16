@@ -4,7 +4,7 @@
 
 详细说明请查看：
 
-- [PROJECT_DOC.md](D:/University/课程/Python/weatherVisualization/PROJECT_DOC.md)
+- [PROJECT_DOC.md](weatherVisualization/PROJECT_DOC.md)
 
 ## 快速开始
 
@@ -32,6 +32,16 @@ python china_weather_spider_analysis.py --force-refresh
 python china_weather_spider_analysis.py --workers 1
 ```
 
+如需启用大屏中的“更新全部数据”“仅重抓失败数据”“中断任务”按钮，请启动本地控制服务：
+
+```powershell
+python china_weather_spider_analysis.py --serve-dashboard --workers 1
+```
+
+也可以直接双击：
+
+- [start_dashboard.bat](weatherVisualization/start_dashboard.bat)
+
 ## 输出文件
 
 - `data/raw/`：城市级原始抓取缓存
@@ -48,6 +58,11 @@ python china_weather_spider_analysis.py --workers 1
 - 地图已支持双击省份进入省内城市视图
 - 地图自动播放已改为直接切换月份，不再做过渡插值
 - 城市缓存命名已优先使用行政区代码，避免重名城市互相覆盖
+- 可视化大屏已支持本地按钮触发“更新全部数据”和“仅重抓失败数据”
+- 大屏更新任务已支持显示总进度、成功数、失败数和当前处理城市
+- 任务运行中会临时禁用两个更新按钮，并启用“中断任务”按钮，避免重复启动
+- 抓取失败城市会写入 `.api_cache/failed_cities.json`，便于后续只补抓失败部分
+- 项目已提供 [start_dashboard.bat](weatherVisualization/start_dashboard.bat) 用于一键启动本地服务并打开大屏
 - 台湾城市已加入采样，但当前代理环境下尚未成功抓取到台湾数据
 - 趋势图高亮功能已按当前版本要求移除，以保证页面稳定性
 - 但现有 `data/processed` 是否已经更新为完整地级市数据，取决于最近一次全量抓取是否成功
