@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, List
@@ -34,6 +35,8 @@ DASHBOARD_STATUS_FILE = API_CACHE_DIR / "dashboard_status.json"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 ALIYUN_BOUND_URL = "https://geo.datav.aliyun.com/areas_v3/bound/{code}_full.json"
 DEFAULT_DASHBOARD_API_PORT = 8765
+DEFAULT_REQUEST_TIMEOUT = 45
+DEFAULT_RETRY_ATTEMPTS = 6
 
 DAILY_FILE = PROCESSED_DIR / "china_weather_daily_5y.csv"
 MONTHLY_FILE = PROCESSED_DIR / "china_weather_monthly_5y.csv"
@@ -305,6 +308,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=2, help="并发抓取线程数")
     parser.add_argument("--serve-dashboard", action="store_true", help="启动大屏按钮控制服务")
     parser.add_argument("--api-port", type=int, default=DEFAULT_DASHBOARD_API_PORT, help="大屏按钮控制服务端口")
+    parser.add_argument("--init-update", action="store_true", help="启动大屏前先执行一次全量更新")
     return parser.parse_args()
 
 
@@ -336,20 +340,62 @@ def admin_cache_file(code: str) -> Path:
     return ADMIN_DIVISION_CACHE_DIR / f"{code}_full.json"
 
 
+def request_json_with_retries(
+    url: str,
+    *,
+    params: dict | None = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    attempts: int = DEFAULT_RETRY_ATTEMPTS,
+) -> dict:
+    # 将重试和退避统一收口，天气接口与行政区划接口共用同一套限流处理，
+    # 同时在大屏发出中断请求后也能及时停止等待。
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        if dashboard_cancel_event.is_set():
+            raise InterruptedError("任务已中断")
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers={"User-Agent": "china-weather-analysis/1.0"},
+            )
+            if response.status_code in {429, 500, 502, 503, 504}:
+                wait_seconds = min(20, 1.8 ** attempt + random.uniform(0.4, 1.2))
+                sleep_with_cancel(wait_seconds)
+                last_error = RuntimeError(f"HTTP {response.status_code}")
+                continue
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            wait_seconds = min(20, 1.5 ** attempt + random.uniform(0.3, 1.0))
+            sleep_with_cancel(wait_seconds)
+    raise RuntimeError(str(last_error) if last_error else f"请求失败: {url}")
+
+
+def sleep_with_cancel(seconds: float) -> None:
+    end_at = time.time() + max(0.0, seconds)
+    while time.time() < end_at:
+        if dashboard_cancel_event.is_set():
+            raise InterruptedError("任务已中断")
+        time.sleep(min(0.2, max(0.0, end_at - time.time())))
+
+
 def fetch_admin_geojson(code: str, force_refresh: bool = False) -> dict:
     cache_file = admin_cache_file(code)
     if cache_file.exists() and not force_refresh:
         return json.loads(cache_file.read_text(encoding="utf-8"))
 
-    response = requests.get(
-        ALIYUN_BOUND_URL.format(code=code),
-        timeout=60,
-        headers={"User-Agent": "china-weather-analysis/1.0"},
-    )
-    response.raise_for_status()
-    payload = response.json()
-    cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    return payload
+    try:
+        payload = request_json_with_retries(ALIYUN_BOUND_URL.format(code=code))
+        cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return payload
+    except Exception:
+        if cache_file.exists():
+            print(f"[CACHE] 行政区划 {code} 请求失败，回退到本地缓存 {cache_file.name}")
+            return json.loads(cache_file.read_text(encoding="utf-8"))
+        raise
 
 
 def extract_feature_center(feature: dict) -> tuple[float, float] | None:
@@ -358,6 +404,11 @@ def extract_feature_center(feature: dict) -> tuple[float, float] | None:
     if isinstance(center, list) and len(center) >= 2:
         return float(center[1]), float(center[0])
     return None
+
+
+def get_fallback_cities_for_province(province_name: str) -> list[City]:
+    normalized = normalize_province_name(province_name)
+    return [city for city in FALLBACK_CITIES if normalize_province_name(city.province) == normalized]
 
 
 def build_prefecture_level_cities(force_refresh: bool = False) -> list[City]:
@@ -369,8 +420,13 @@ def build_prefecture_level_cities(force_refresh: bool = False) -> list[City]:
         try:
             geojson = fetch_admin_geojson(province_code, force_refresh=force_refresh)
         except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] {province_name} 行政区划加载失败，稍后回退到内置城市样本: {exc}")
-            return FALLBACK_CITIES
+            # 单个省份行政区划失败时，只回退这个省，不应让整次任务
+            # 直接退回旧的全国样本城市集合。
+            print(f"[WARN] {province_name} 行政区划加载失败，回退到该省内置城市样本: {exc}")
+            province_fallback = get_fallback_cities_for_province(province_name)
+            if province_fallback:
+                cities.extend(province_fallback)
+            continue
 
         features = geojson.get("features", [])
         province_cities: list[City] = []
@@ -427,12 +483,14 @@ def fetch_city_weather(city: City, start_date: date, end_date: date, force_refre
     if dashboard_cancel_event.is_set():
         raise InterruptedError("任务已中断")
     cache_file = city_cache_file(city, start_date, end_date)
+    fallback_cache = find_latest_city_cache(city)
     if cache_file.exists() and not force_refresh:
         df = pd.read_csv(cache_file, parse_dates=["time"])
         return df
 
     if not force_refresh:
-        fallback_cache = find_latest_city_cache(city)
+        # 如果当前日期范围的缓存不存在，优先回退到最近一次成功缓存，
+        # 这样当天网络失败时页面仍然能继续使用。
         if fallback_cache is not None and fallback_cache != cache_file:
             df = pd.read_csv(fallback_cache, parse_dates=["time"])
             print(f"[CACHE] {city.city} 使用历史缓存 {fallback_cache.name}")
@@ -460,28 +518,20 @@ def fetch_city_weather(city: City, start_date: date, end_date: date, force_refre
     }
     payload = None
     last_error = None
-    for attempt in range(4):
-        try:
-            response = requests.get(
-                OPEN_METEO_ARCHIVE_URL,
-                params=params,
-                timeout=60,
-                headers={"User-Agent": "china-weather-analysis/1.0"},
-            )
-            if response.status_code == 429:
-                wait_seconds = 2 * (attempt + 1)
-                time.sleep(wait_seconds)
-                last_error = RuntimeError(f"{city.city} 请求过快，已重试 {attempt + 1} 次")
-                continue
-            response.raise_for_status()
-            payload = response.json()
-            break
-        except requests.RequestException as exc:
-            last_error = exc
-            time.sleep(1.5 * (attempt + 1))
+    sleep_with_cancel(random.uniform(0.05, 0.3))
+    try:
+        payload = request_json_with_retries(
+            OPEN_METEO_ARCHIVE_URL,
+            params=params,
+            timeout=DEFAULT_REQUEST_TIMEOUT,
+            attempts=DEFAULT_RETRY_ATTEMPTS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        last_error = exc
 
     if payload is None:
-        fallback_cache = find_latest_city_cache(city)
+        # 即使在强制刷新模式下，回退到旧的成功缓存也比直接丢掉这个城市更稳妥，
+        # 至少不会让处理结果里整块缺数据。
         if fallback_cache is not None:
             df = pd.read_csv(fallback_cache, parse_dates=["time"])
             print(f"[CACHE] {city.city} 网络失败，回退到历史缓存 {fallback_cache.name}")
@@ -507,7 +557,7 @@ def crawl_weather_data(cities: Iterable[City], start_date: date, end_date: date,
     city_list = list(cities)
     total = len(city_list)
     frames: list[pd.DataFrame] = []
-    errors: list[str] = []
+    errors: dict[str, str] = {}
     failed_city_objs: list[City] = []
     completed = 0
 
@@ -550,9 +600,42 @@ def crawl_weather_data(cities: Iterable[City], start_date: date, end_date: date,
                 save_failed_cities(failed_city_objs)
                 raise
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{city.city}: {exc}")
+                errors[city.city] = str(exc)
                 failed_city_objs.append(city)
                 print(f"[WARN] {city.city} 抓取失败: {exc}")
+            write_dashboard_status(
+                {
+                    **read_dashboard_status(),
+                    "running": True,
+                    "message": "抓取进行中",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total": total,
+                    "completed": completed,
+                    "success_count": len(frames),
+                    "failed_count": len(failed_city_objs),
+                    "current_city": city.city,
+                }
+            )
+
+    if failed_city_objs and not dashboard_cancel_event.is_set():
+        # 网络或接口失败很多是瞬时问题，补一轮顺序重试虽然更慢，
+        # 但通常能明显降低最终失败城市数量。
+        retry_candidates = failed_city_objs[:]
+        failed_city_objs = []
+        print(f"\n[RETRY] 并发阶段失败 {len(retry_candidates)} 个城市，开始顺序重试")
+        for city in retry_candidates:
+            if dashboard_cancel_event.is_set():
+                failed_city_objs.append(city)
+                continue
+            try:
+                frames.append(fetch_city_weather(city, start_date, end_date, force_refresh))
+                errors.pop(city.city, None)
+                print(f"[RETRY-OK] {city.city} 重试成功")
+            except Exception as exc:  # noqa: BLE001
+                errors[city.city] = str(exc)
+                failed_city_objs.append(city)
+                print(f"[RETRY-WARN] {city.city} 重试失败: {exc}")
+            completed = min(total, len(frames) + len(failed_city_objs))
             write_dashboard_status(
                 {
                     **read_dashboard_status(),
@@ -573,8 +656,8 @@ def crawl_weather_data(cities: Iterable[City], start_date: date, end_date: date,
 
     if errors:
         print("\n部分城市抓取失败：")
-        for msg in errors:
-            print(f"- {msg}")
+        for city_name, msg in errors.items():
+            print(f"- {city_name}: {msg}")
 
     save_failed_cities(failed_city_objs)
     df = pd.concat(frames, ignore_index=True)
@@ -695,13 +778,6 @@ def make_geo_scatter(trend_df: pd.DataFrame) -> Scatter:
         itemstyle_opts=opts.ItemStyleOpts(opacity=0.9),
     )
     chart.set_global_opts(
-        title_opts=opts.TitleOpts(
-            title="中国主要城市近五年气候空间分布",
-            subtitle="横轴为经度，纵轴为纬度，颜色与点径共同反映近五年均温",
-            pos_left="3%",
-            title_textstyle_opts=opts.TextStyleOpts(font_size=22, font_weight="bold", color="#17324d"),
-            subtitle_textstyle_opts=opts.TextStyleOpts(color="#5f7488"),
-        ),
         xaxis_opts=opts.AxisOpts(
             name="经度",
             min_=80,
@@ -766,7 +842,6 @@ def make_trend_line(monthly_df: pd.DataFrame) -> Line:
         label_opts=opts.LabelOpts(is_show=False),
     )
     line.set_global_opts(
-        title_opts=opts.TitleOpts(title="近五年全国样本月度气温趋势与距平"),
         yaxis_opts=opts.AxisOpts(name="温度 (℃)"),
         tooltip_opts=opts.TooltipOpts(trigger="axis"),
         datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
@@ -792,7 +867,6 @@ def make_heatmap(monthly_df: pd.DataFrame) -> HeatMap:
     chart.add_xaxis(months)
     chart.add_yaxis("月均温", regions, heat_data)
     chart.set_global_opts(
-        title_opts=opts.TitleOpts(title="区域月度平均气温热力图"),
         visualmap_opts=opts.VisualMapOpts(min_=-20, max_=32, pos_right="10"),
     )
     return chart
@@ -806,7 +880,6 @@ def make_warming_bar(trend_df: pd.DataFrame) -> Bar:
     chart.reversal_axis()
     chart.set_series_opts(label_opts=opts.LabelOpts(position="right"))
     chart.set_global_opts(
-        title_opts=opts.TitleOpts(title="近五年升温趋势最明显城市 TOP12"),
         xaxis_opts=opts.AxisOpts(name="每月升温斜率"),
         yaxis_opts=opts.AxisOpts(name="城市"),
         legend_opts=opts.LegendOpts(is_show=False),
@@ -854,11 +927,6 @@ def make_radar(monthly_df: pd.DataFrame) -> Radar:
             areastyle_opts=opts.AreaStyleOpts(opacity=0.16),
         )
     chart.set_global_opts(
-        title_opts=opts.TitleOpts(
-            title="典型区域气候特征雷达图",
-            pos_left="3%",
-            title_textstyle_opts=opts.TextStyleOpts(font_size=20, font_weight="bold", color="#17324d"),
-        ),
         legend_opts=opts.LegendOpts(pos_top="4%", pos_right="4%"),
     )
     return chart
@@ -896,7 +964,6 @@ def make_scatter(monthly_df: pd.DataFrame) -> Scatter:
         )
     )
     chart.set_global_opts(
-        title_opts=opts.TitleOpts(title=f"{latest_year} 年城市温度与降水关系散点图"),
         xaxis_opts=opts.AxisOpts(name="年平均气温 (℃)"),
         yaxis_opts=opts.AxisOpts(name="月平均降水量 (mm)"),
         tooltip_opts=opts.TooltipOpts(
@@ -1166,12 +1233,13 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
     scatter_chart = make_scatter(monthly_df)
     map_timeline_config = build_map_timeline_config_v2(monthly_df)
 
-    hottest_city = trend_df.sort_values("avg_temp_5y", ascending=False).iloc[0]
-    coolest_city = trend_df.sort_values("avg_temp_5y", ascending=True).iloc[0]
-    wettest_city = trend_df.sort_values("precipitation_5y", ascending=False).iloc[0]
-    fastest_warming = trend_df.sort_values("temp_slope_per_month", ascending=False).iloc[0]
     city_count = int(monthly_df["city"].nunique())
+    province_count = int(monthly_df["province"].nunique())
     month_count = int(monthly_df["year_month"].nunique())
+    latest_period = str(monthly_df["year_month"].max())
+    failed_count = len(load_failed_cities())
+    hottest_city = trend_df.sort_values("avg_temp_5y", ascending=False).iloc[0]
+    wettest_city = trend_df.sort_values("precipitation_5y", ascending=False).iloc[0]
 
     dependencies = sorted(
         set(
@@ -1302,10 +1370,25 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             flex-wrap: wrap;
         }}
         .map-actions {{
+            display: grid;
+            gap: 10px;
+            min-width: min(100%, 820px);
+        }}
+        .action-row {{
             display: flex;
             align-items: center;
             gap: 10px;
             flex-wrap: wrap;
+        }}
+        .action-group {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            min-height: 42px;
+        }}
+        .action-group.controls {{
+            margin-left: auto;
         }}
         .job-actions {{
             display: flex;
@@ -1346,19 +1429,36 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             cursor: pointer;
             box-shadow: 0 10px 22px rgba(34, 100, 129, 0.22);
         }}
+        .metric-btn,
+        .ghost-btn,
+        .job-btn {{
+            min-height: 42px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            white-space: nowrap;
+        }}
         .status-pill {{
             padding: 9px 14px;
             border-radius: 999px;
             background: rgba(19, 40, 59, 0.08);
             color: #35546d;
             font-size: 13px;
+            min-height: 42px;
+            display: inline-flex;
+            align-items: center;
         }}
         .job-status {{
             padding: 9px 14px;
-            border-radius: 999px;
+            border-radius: 16px;
             background: rgba(20, 67, 108, 0.08);
             color: #2f5877;
             font-size: 13px;
+            min-height: 42px;
+            display: flex;
+            align-items: center;
+            flex: 1;
+            min-width: 280px;
         }}
         .job-progress-wrap {{
             min-width: 320px;
@@ -1459,6 +1559,9 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             .span-7, .span-5, .span-6 {{
                 grid-column: span 12;
             }}
+            .action-group.controls {{
+                margin-left: 0;
+            }}
         }}
         @media (max-width: 720px) {{
             .dashboard {{
@@ -1474,6 +1577,14 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             .hero h1 {{
                 font-size: 28px;
             }}
+            .action-row {{
+                align-items: stretch;
+            }}
+            .action-group,
+            .job-actions,
+            .job-status {{
+                width: 100%;
+            }}
         }}
     </style>
 </head>
@@ -1482,31 +1593,31 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
         <div class="hero">
             <div>
                 <h1>中国近五年天气可视化分析</h1>
-                <p>基于中国主要城市近五年历史天气数据生成，覆盖均温、降水、升温趋势、区域差异与体感特征。</p>
+                <p>基于当前已成功落地的城市样本生成，展示近五年温度、降水、风速、升温趋势与区域差异。</p>
             </div>
-            <div class="hero-badge">样本城市 {city_count} 个 · 月度样本 {month_count} 个月</div>
+            <div class="hero-badge">样本城市 {city_count} 个 · 覆盖省级区域 {province_count} 个 · 待重抓 {failed_count} 个</div>
         </div>
 
         <div class="cards">
             <div class="card">
-                <div class="card-label">近五年均温最高城市</div>
-                <div class="card-value">{hottest_city['city']}</div>
-                <div class="card-sub">{hottest_city['avg_temp_5y']:.2f} ℃</div>
+                <div class="card-label">当前样本覆盖城市</div>
+                <div class="card-value">{city_count}</div>
+                <div class="card-sub">月度样本 {month_count} 个月</div>
             </div>
             <div class="card">
-                <div class="card-label">近五年均温最低城市</div>
-                <div class="card-value">{coolest_city['city']}</div>
-                <div class="card-sub">{coolest_city['avg_temp_5y']:.2f} ℃</div>
+                <div class="card-label">当前覆盖省级区域</div>
+                <div class="card-value">{province_count}</div>
+                <div class="card-sub">基于已成功抓取并处理的数据</div>
             </div>
             <div class="card">
-                <div class="card-label">月均降水最强城市</div>
-                <div class="card-value">{wettest_city['city']}</div>
-                <div class="card-sub">{wettest_city['precipitation_5y']:.2f} mm</div>
+                <div class="card-label">最新月份</div>
+                <div class="card-value">{latest_period}</div>
+                <div class="card-sub">当前时间序列已更新到该月份</div>
             </div>
             <div class="card">
-                <div class="card-label">升温趋势最明显城市</div>
-                <div class="card-value">{fastest_warming['city']}</div>
-                <div class="card-sub">月度斜率 {fastest_warming['temp_slope_per_month']:.4f}</div>
+                <div class="card-label">待重抓失败城市</div>
+                <div class="card-value">{failed_count}</div>
+                <div class="card-sub">可通过上方按钮继续补抓</div>
             </div>
         </div>
 
@@ -1518,20 +1629,26 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
                         <div class="panel-sub">拖动时间轴查看不同月份各省气温、降水和风速变化，点击右侧按钮切换指标。</div>
                     </div>
                     <div class="map-actions">
-                        <div class="metric-switch">
-                            <button class="metric-btn active" data-metric="avg_temp">平均气温</button>
-                            <button class="metric-btn" data-metric="precipitation">降水量</button>
-                            <button class="metric-btn" data-metric="wind_speed">平均风速</button>
+                        <div class="action-row">
+                            <div class="action-group metric-switch">
+                                <button class="metric-btn active" data-metric="avg_temp">平均气温</button>
+                                <button class="metric-btn" data-metric="precipitation">降水量</button>
+                                <button class="metric-btn" data-metric="wind_speed">平均风速</button>
+                            </div>
+                            <div class="action-group controls">
+                                <button class="ghost-btn" id="timeline-play">自动播放</button>
+                                <button class="ghost-btn" id="timeline-reset">查看全国</button>
+                                <div class="status-pill" id="selected-province-label">当前联动：全国平均</div>
+                            </div>
                         </div>
-                        <div class="job-actions">
-                            <button class="job-btn" id="refresh-all-btn">更新全部数据</button>
-                            <button class="job-btn" id="refresh-failed-btn">仅重抓失败数据</button>
-                            <button class="ghost-btn" id="cancel-job-btn" disabled>中断任务</button>
+                        <div class="action-row">
+                            <div class="action-group job-actions">
+                                <button class="job-btn" id="refresh-all-btn">更新全部数据</button>
+                                <button class="job-btn" id="refresh-failed-btn">仅重抓失败数据</button>
+                                <button class="ghost-btn" id="cancel-job-btn" disabled>中断任务</button>
+                            </div>
+                            <div class="job-status" id="job-status-label">数据任务：未连接按钮服务</div>
                         </div>
-                        <button class="ghost-btn" id="timeline-play">自动播放</button>
-                        <button class="ghost-btn" id="timeline-reset">查看全国</button>
-                        <div class="status-pill" id="selected-province-label">当前联动：全国平均</div>
-                        <div class="job-status" id="job-status-label">数据任务：未连接按钮服务</div>
                     </div>
                 </div>
                 <div class="map-meta">
@@ -1569,12 +1686,60 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
                 </div>
                 <div id="province-trend"></div>
             </section>
-            <section class="panel span-12">{geo_chart.render_embed()}</section>
-            <section class="panel span-12">{line_chart.render_embed()}</section>
-            <section class="panel span-7">{heatmap_chart.render_embed()}</section>
-            <section class="panel span-5">{warming_chart.render_embed()}</section>
-            <section class="panel span-6">{radar_chart.render_embed()}</section>
-            <section class="panel span-6">{scatter_chart.render_embed()}</section>
+            <section class="panel span-12">
+                <div class="panel-head">
+                    <div>
+                        <div class="panel-title">城市样本空间分布</div>
+                        <div class="panel-sub">当前样本按经纬度展开，点大小与颜色共同反映近五年平均气温。当前最热样本城市为 {hottest_city['city']}，月均降水最强样本城市为 {wettest_city['city']}。</div>
+                    </div>
+                </div>
+                {geo_chart.render_embed()}
+            </section>
+            <section class="panel span-12">
+                <div class="panel-head">
+                    <div>
+                        <div class="panel-title">当前样本月度温度趋势</div>
+                        <div class="panel-sub">这里展示的是当前已成功落地样本城市的平均温度与温度距平，用于观察整体季节波动与年际变化。</div>
+                    </div>
+                </div>
+                {line_chart.render_embed()}
+            </section>
+            <section class="panel span-7">
+                <div class="panel-head">
+                    <div>
+                        <div class="panel-title">区域月度温度热力</div>
+                        <div class="panel-sub">按区域和月份统计平均气温，适合观察季节性差异和南北温度梯度。</div>
+                    </div>
+                </div>
+                {heatmap_chart.render_embed()}
+            </section>
+            <section class="panel span-5">
+                <div class="panel-head">
+                    <div>
+                        <div class="panel-title">升温趋势城市排行</div>
+                        <div class="panel-sub">基于月均温线性斜率排序，展示当前样本中升温趋势更明显的城市。</div>
+                    </div>
+                </div>
+                {warming_chart.render_embed()}
+            </section>
+            <section class="panel span-6">
+                <div class="panel-head">
+                    <div>
+                        <div class="panel-title">区域气候特征对比</div>
+                        <div class="panel-sub">对比典型区域的温度、降水、风速、体感温度和舒适度综合特征。</div>
+                    </div>
+                </div>
+                {radar_chart.render_embed()}
+            </section>
+            <section class="panel span-6">
+                <div class="panel-head">
+                    <div>
+                        <div class="panel-title">温度与降水关系</div>
+                        <div class="panel-sub">使用最新年份样本城市的年平均温度、月均降水和风速，观察城市气候分布。</div>
+                    </div>
+                </div>
+                {scatter_chart.render_embed()}
+            </section>
         </div>
     </div>
     <script>
@@ -1969,6 +2134,7 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
             try {{
                 if (path === '/api/update/cancel') {{
                     cancelJobBtn.disabled = true;
+                    jobStatusLabel.textContent = '数据任务：已发送中断请求，等待当前城市结束';
                 }} else {{
                     refreshAllBtn.disabled = true;
                     refreshFailedBtn.disabled = true;
@@ -1979,6 +2145,15 @@ def build_dashboard(monthly_df: pd.DataFrame, trend_df: pd.DataFrame) -> None:
                 }});
                 const data = await res.json();
                 jobStatusLabel.textContent = '数据任务：' + data.message;
+                if (!res.ok || data.ok === false) {{
+                    if (path !== '/api/update/cancel') {{
+                        refreshAllBtn.disabled = false;
+                        refreshFailedBtn.disabled = false;
+                    }}
+                    cancelJobBtn.disabled = true;
+                    window.alert('数据任务未启动\\n' + (data.message || '请求失败'));
+                    return;
+                }}
                 lastJobRunning = false;
                 lastJobUpdatedAt = '';
                 fetchJobStatus();
@@ -2410,16 +2585,18 @@ def save_outputs(daily_df: pd.DataFrame, monthly_df: pd.DataFrame) -> None:
 def run_pipeline(force_refresh: bool = False, workers: int = 2, failed_only: bool = False) -> dict:
     ensure_dirs()
     start_date, end_date = calc_date_range()
-    all_cities = build_prefecture_level_cities(force_refresh=force_refresh)
     if failed_only:
-        failed_codes = {city.city_code for city in load_failed_cities() if city.city_code}
-        failed_names = {(city.province, city.city) for city in load_failed_cities() if not city.city_code}
-        cities = [
-            city
-            for city in all_cities
-            if (city.city_code and city.city_code in failed_codes)
-            or ((not city.city_code) and (city.province, city.city) in failed_names)
-        ]
+        # 失败重抓模式直接使用落盘的失败清单，
+        # 不再依赖重新构建城市列表后二次匹配。
+        failed_cities = load_failed_cities()
+        cities = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        for city in failed_cities:
+            city_key = (city.city_code or "", city.province, city.city)
+            if city_key in seen_keys:
+                continue
+            cities.append(city)
+            seen_keys.add(city_key)
         if not cities:
             write_dashboard_status(
                 {
@@ -2438,12 +2615,15 @@ def run_pipeline(force_refresh: bool = False, workers: int = 2, failed_only: boo
             )
             return {"ok": True, "message": "没有可重试的失败城市", "city_count": 0}
     else:
+        all_cities = build_prefecture_level_cities(force_refresh=force_refresh)
         cities = all_cities
 
     print(f"抓取区间: {start_date.isoformat()} -> {end_date.isoformat()}")
     print(f"城市样本: {len(cities)}")
     daily_df = crawl_weather_data(cities, start_date, end_date, force_refresh, workers)
     if failed_only and DAILY_FILE.exists():
+        # 将补抓成功的失败城市合并回现有日度表，
+        # 避免局部重抓把完整处理结果覆盖掉。
         existing_daily = pd.read_csv(DAILY_FILE, parse_dates=["date"])
         target_keys = {(city.city_code or "", city.city) for city in cities}
         existing_daily["city_code"] = existing_daily["city_code"].fillna("") if "city_code" in existing_daily.columns else ""
@@ -2490,11 +2670,12 @@ dashboard_cancel_event = threading.Event()
 
 
 def start_dashboard_job(force_refresh: bool, workers: int, failed_only: bool) -> tuple[bool, str]:
-    if dashboard_job_lock.locked():
+    # 在线程真正启动前先拿锁，避免用户在后台任务刚创建但尚未标记运行时
+    # 点击中断，导致后端误判“当前没有任务”。
+    if not dashboard_job_lock.acquire(blocking=False):
         return False, "已有更新任务正在运行"
 
     def runner() -> None:
-        dashboard_job_lock.acquire()
         dashboard_cancel_event.clear()
         try:
             write_dashboard_status(
@@ -2632,6 +2813,21 @@ def serve_dashboard(api_port: int, workers: int) -> None:
 def main() -> None:
     args = parse_args()
     result: dict | None = None
+
+    if args.serve_dashboard and not args.init_update:
+        # 大屏模式优先走快速启动：先把本地控制服务拉起来，
+        # 后续是否更新数据由页面按钮按需触发。
+        write_dashboard_status(
+            {
+                "running": False,
+                "message": "控制服务已启动，等待任务",
+                "failed_count": len(load_failed_cities()),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        serve_dashboard(api_port=args.api_port, workers=args.workers)
+        return
+
     try:
         result = run_pipeline(force_refresh=args.force_refresh, workers=args.workers, failed_only=False)
 

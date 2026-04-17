@@ -38,6 +38,13 @@ python china_weather_spider_analysis.py --workers 1
 python china_weather_spider_analysis.py --serve-dashboard --workers 1
 ```
 
+如需“先启动大屏服务，再按页面按钮按需更新”，上面这条命令已经会直接进入本地服务，不再先执行整套全量抓取。
+如需在启动服务前先跑一次全量更新，可使用：
+
+```powershell
+python china_weather_spider_analysis.py --serve-dashboard --workers 1 --init-update
+```
+
 也可以直接双击：
 
 - [start_dashboard.bat](weatherVisualization/start_dashboard.bat)
@@ -63,6 +70,12 @@ python china_weather_spider_analysis.py --serve-dashboard --workers 1
 - 任务运行中会临时禁用两个更新按钮，并启用“中断任务”按钮，避免重复启动
 - 抓取失败城市会写入 `.api_cache/failed_cities.json`，便于后续只补抓失败部分
 - 项目已提供 [start_dashboard.bat](weatherVisualization/start_dashboard.bat) 用于一键启动本地服务并打开大屏
+- 天气接口与行政区划接口已补充统一重试、退避和可中断等待，降低瞬时失败率
+- 行政区划接口失败时已改为“只回退当前省”，不再因为单省失败整批退回旧样本
+- “仅重抓失败数据”已改为直接使用失败清单，不再依赖重新匹配当前城市列表
+- 中断任务按钮已补充即时状态反馈，并优化了启动与中断之间的竞态问题
+- 大屏除地图外的摘要卡片和图表说明已调整为“当前样本”口径，更符合实际落地数据状态
+- 核心抓取与控制逻辑已补充中文注释，便于后续维护
 - 台湾城市已加入采样，但当前代理环境下尚未成功抓取到台湾数据
 - 趋势图高亮功能已按当前版本要求移除，以保证页面稳定性
 - 但现有 `data/processed` 是否已经更新为完整地级市数据，取决于最近一次全量抓取是否成功
